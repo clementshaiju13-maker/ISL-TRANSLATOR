@@ -1,0 +1,4 @@
+tensorflow-cpu
+mediapipe
+opencv-python-headless
+gradio
