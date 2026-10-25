@@ -2,9 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install the missing OpenGL and graphics drivers required by MediaPipe
+# Install all graphics drivers required by MediaPipe and OpenCV
 RUN apt-get update && apt-get install -y \
     libgl1 \
+    libegl1 \
     libgles2 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
