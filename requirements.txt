@@ -1,4 +1,7 @@
+streamlit
+streamlit-webrtc
 tensorflow-cpu
 mediapipe
 opencv-python-headless
-gradio
+av
+numpy
