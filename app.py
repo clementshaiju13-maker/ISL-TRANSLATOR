@@ -1,26 +1,39 @@
 import os
 import pickle
 import time
+import av
+import cv2
 import numpy as np
 import tensorflow as tf
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-import gradio as gr
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
-# 1. Load Model & Label Classes
-model = tf.keras.models.load_model("isl_nn_model.h5")
-with open("isl_classes.pickle", "rb") as f:
-    class_names = pickle.load(f)
+# Page setup
+st.set_page_config(page_title="ISL Continuous Translator", layout="centered")
+st.title("Indian Sign Language (ISL) Real-Time Translator")
+st.write("Hold your sign steady for **1 second** to automatically register the letter.")
 
-base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
-options = vision.HandLandmarkerOptions(
-    base_options=base_options,
-    num_hands=2,
-    min_hand_detection_confidence=0.25,
-    min_hand_presence_confidence=0.25
-)
-detector = vision.HandLandmarker.create_from_options(options)
+# 1. Load ML Model & Labels
+@st.cache_resource
+def load_isl_assets():
+    model = tf.keras.models.load_model("isl_nn_model.h5")
+    with open("isl_classes.pickle", "rb") as f:
+        class_names = pickle.load(f)
+
+    base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        num_hands=2,
+        min_hand_detection_confidence=0.25,
+        min_hand_presence_confidence=0.25
+    )
+    detector = vision.HandLandmarker.create_from_options(options)
+    return model, class_names, detector
+
+model, class_names, detector = load_isl_assets()
 
 def extract_features(landmarks_list):
     sorted_hands = sorted(landmarks_list, key=lambda hand: hand[0].x)
@@ -39,102 +52,96 @@ def extract_features(landmarks_list):
             vector.extend([0.0] * 42)
     return np.array([vector], dtype=np.float32)
 
-# Global tracker for hands-free letter locking
-tracker = {
-    "candidate": None,
-    "first_seen": 0,
-    "last_confirmed_time": 0
-}
+# Global variables for continuous state tracking
+class AppState:
+    current_word = ""
+    sentence = ""
+    candidate = None
+    first_seen = 0.0
+    last_confirmed = 0.0
 
-HOLD_TIME = 1.2        # Must hold sign steady for 1.2s to commit
-COOLDOWN_TIME = 2.0    # 2s cooldown before the same letter can be added again
+HOLD_TIME = 1.0
+COOLDOWN = 1.5
 
-def process_stream(image, current_word, current_sentence):
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    img = frame.to_ndarray(format="bgr24")
+    img = cv2.flip(img, 1)
+
+    # Downscale for smooth cloud processing
+    small_img = cv2.resize(img, (320, 240))
+    rgb_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
+
+    results = detector.detect(mp_image)
     now = time.time()
-    
-    if image is None:
-        return "Camera loading...", "0%", current_word, current_sentence, "Start recording to activate camera"
+    detected_letter = ""
+    conf = 0.0
 
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
-    res = detector.detect(mp_image)
+    if results.hand_landmarks:
+        feats = extract_features(results.hand_landmarks)
+        preds = model.predict(feats, verbose=0)[0]
+        idx = np.argmax(preds)
+        conf = float(preds[idx])
 
-    if not res.hand_landmarks:
-        tracker["candidate"] = None
-        return "No hands visible", "0%", current_word, current_sentence, "Place both hands in front of camera"
-
-    feats = extract_features(res.hand_landmarks)
-    preds = model.predict(feats, verbose=0)[0]
-    idx = np.argmax(preds)
-    conf = float(preds[idx])
-    detected_letter = class_names[idx]
-
-    if conf < 0.40:
-        tracker["candidate"] = None
-        return "Uncertain gesture", f"{conf * 100:.1f}%", current_word, current_sentence, "Adjust your hand shape"
-
-    status_msg = f"Holding '{detected_letter}'..."
-
-    # Hands-free auto-commit logic
-    if tracker["candidate"] == detected_letter:
-        elapsed = now - tracker["first_seen"]
-        progress_pct = min(100, int((elapsed / HOLD_TIME) * 100))
-        status_msg = f"Holding '{detected_letter}'... {progress_pct}%"
-
-        if elapsed >= HOLD_TIME and (now - tracker["last_confirmed_time"] > COOLDOWN_TIME):
-            current_word += detected_letter
-            tracker["last_confirmed_time"] = now
-            status_msg = f"Added '{detected_letter}' to word!"
+        if conf > 0.40:
+            detected_letter = class_names[idx]
+            if AppState.candidate == detected_letter:
+                elapsed = now - AppState.first_seen
+                if elapsed >= HOLD_TIME and (now - AppState.last_confirmed > COOLDOWN):
+                    AppState.current_word += detected_letter
+                    AppState.last_confirmed = now
+            else:
+                AppState.candidate = detected_letter
+                AppState.first_seen = now
+        else:
+            AppState.candidate = None
     else:
-        tracker["candidate"] = detected_letter
-        tracker["first_seen"] = now
+        AppState.candidate = None
 
-    return detected_letter, f"{conf * 100:.1f}%", current_word, current_sentence, status_msg
+    # Render on-screen HUD directly on video stream
+    h, w, _ = img.shape
+    cv2.rectangle(img, (0, 0), (w, 80), (30, 30, 30), -1)
+    status_text = f"Sign: {detected_letter} ({conf*100:.0f}%)" if detected_letter else "Sign: --"
+    cv2.putText(img, status_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(img, f"Word: {AppState.current_word}", (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-# Helper button actions (to finish words or clear)
-def add_space(word, sentence):
-    if word:
-        sentence = (sentence + " " + word).strip()
-    return "", sentence
+    cv2.rectangle(img, (0, h - 50), (w, h), (20, 20, 20), -1)
+    cv2.putText(img, f"Sentence: {AppState.sentence}", (15, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-def backspace(word):
-    return word[:-1]
+    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-def clear_all():
-    return "", ""
+# Google STUN server configuration for WebRTC
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
-# Build Gradio UI
-with gr.Blocks(title="Indian Sign Language Translator") as demo:
-    gr.Markdown("# Indian Sign Language (ISL) Translator")
-    gr.Markdown("Hold a sign steady for **1.2 seconds** to automatically add it to your word.")
+# 2. WebRTC Live Video Streamer (No shutter buttons needed)
+webrtc_streamer(
+    key="isl-streamer",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=RTC_CONFIGURATION,
+    video_frame_callback=video_frame_callback,
+    media_stream_constraints={"video": True, "audio": False},
+    async_processing=True,
+)
 
-    with gr.Row():
-        with gr.Column(scale=3):
-            cam = gr.Image(sources=["webcam"], streaming=True, label="Live Stream")
-            status_box = gr.Textbox(label="Status / Instructions", value="Click Record to begin stream")
+# 3. Interactive Web Controls
+col1, col2, col3 = st.columns(3)
 
-        with gr.Column(scale=2):
-            sign_box = gr.Textbox(label="Detected Sign", text_align="center")
-            conf_box = gr.Textbox(label="Confidence", text_align="center")
-            word_box = gr.Textbox(label="Current Word", value="")
-            sentence_box = gr.Textbox(label="Full Sentence", value="")
+with col1:
+    if st.button("Space (Next Word)"):
+        if AppState.current_word:
+            AppState.sentence = (AppState.sentence + " " + AppState.current_word).strip()
+            AppState.current_word = ""
 
-            with gr.Row():
-                space_btn = gr.Button("Space (Next Word)")
-                del_btn = gr.Button("Backspace")
-                clear_btn = gr.Button("Clear All")
+with col2:
+    if st.button("Backspace"):
+        AppState.current_word = AppState.current_word[:-1]
 
-    # Wire up continuous live stream
-    cam.stream(
-        fn=process_stream,
-        inputs=[cam, word_box, sentence_box],
-        outputs=[sign_box, conf_box, word_box, sentence_box, status_box],
-        stream_every=0.1
-    )
+with col3:
+    if st.button("Clear All"):
+        AppState.current_word = ""
+        AppState.sentence = ""
 
-    space_btn.click(fn=add_space, inputs=[word_box, sentence_box], outputs=[word_box, sentence_box])
-    del_btn.click(fn=backspace, inputs=[word_box], outputs=[word_box])
-    clear_btn.click(fn=clear_all, inputs=[], outputs=[word_box, sentence_box])
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+st.markdown("---")
+st.caption("Press **Space (Next Word)** to transfer the completed word to the sentence.")
